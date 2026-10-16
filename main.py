@@ -16,7 +16,7 @@ ACCESS_TOKEN_EXPIRE_DAYS = 30
 
 DB_FILE = os.getenv("DB_FILE", "grafiton.db")
 
-app = FastAPI(title="Графитон API", version="1.0.0")
+app = FastAPI(title="Графитон API", version="1.1.0")
 
 app.add_middleware(
     CORSMiddleware,
@@ -36,9 +36,16 @@ def init_db():
         password_hash TEXT NOT NULL,
         nickname TEXT NOT NULL,
         avatar_color TEXT NOT NULL,
+        bio TEXT DEFAULT '',
         created_at TIMESTAMP DEFAULT CURRENT_TIMESTAMP
     )
     """)
+    # Check if bio column exists in case upgrading from v1.0
+    cursor.execute("PRAGMA table_info(users)")
+    columns = [col[1] for col in cursor.fetchall()]
+    if "bio" not in columns:
+        cursor.execute("ALTER TABLE users ADD COLUMN bio TEXT DEFAULT ''")
+
     cursor.execute("""
     CREATE TABLE IF NOT EXISTS messages (
         id INTEGER PRIMARY KEY AUTOINCREMENT,
@@ -69,11 +76,17 @@ class UserRegister(BaseModel):
     password: str
     nickname: Optional[str] = None
 
+class UserProfileUpdate(BaseModel):
+    nickname: Optional[str] = None
+    bio: Optional[str] = None
+    avatar_color: Optional[str] = None
+
 class UserResponse(BaseModel):
     id: int
     username: str
     nickname: str
     avatar_color: str
+    bio: Optional[str] = ""
 
 class TokenResponse(BaseModel):
     access_token: str
@@ -117,7 +130,7 @@ def get_current_user(token: str = Depends(oauth2_scheme), conn: sqlite3.Connecti
         raise credentials_exception
     
     cursor = conn.cursor()
-    cursor.execute("SELECT id, username, nickname, avatar_color FROM users WHERE username = ?", (username,))
+    cursor.execute("SELECT id, username, nickname, avatar_color, bio FROM users WHERE username = ?", (username,))
     row = cursor.fetchone()
     if row is None:
         raise credentials_exception
@@ -144,7 +157,6 @@ class ConnectionManager:
     async def broadcast_to_chat(self, chat_id: str, message: dict, sender_id: int, receiver_id: Optional[int] = None):
         data = json.dumps({"type": "new_message", "message": message})
         if chat_id == "general":
-            # Broadcast to everyone connected
             for uid, connections in list(self.active_connections.items()):
                 for ws in connections:
                     try:
@@ -152,7 +164,6 @@ class ConnectionManager:
                     except Exception:
                         pass
         else:
-            # Direct chat: send to sender and receiver
             target_ids = {sender_id}
             if receiver_id:
                 target_ids.add(receiver_id)
@@ -172,8 +183,12 @@ def read_root():
     return {
         "app": "Графитон (Grafiton) Messenger API",
         "status": "online",
-        "version": "1.0.0"
+        "version": "1.1.0"
     }
+
+@app.head("/")
+def head_root():
+    return {}
 
 @app.post("/api/auth/register", response_model=TokenResponse)
 def register(user: UserRegister, conn: sqlite3.Connection = Depends(get_db)):
@@ -188,8 +203,8 @@ def register(user: UserRegister, conn: sqlite3.Connection = Depends(get_db)):
     password_hash = hasher.pbkdf2_sha256.hash(user.password)
 
     cursor.execute(
-        "INSERT INTO users (username, password_hash, nickname, avatar_color) VALUES (?, ?, ?, ?)",
-        (user.username.lower(), password_hash, nickname, avatar_color)
+        "INSERT INTO users (username, password_hash, nickname, avatar_color, bio) VALUES (?, ?, ?, ?, ?)",
+        (user.username.lower(), password_hash, nickname, avatar_color, "Привет, я в Графитоне!")
     )
     conn.commit()
     user_id = cursor.lastrowid
@@ -202,7 +217,8 @@ def register(user: UserRegister, conn: sqlite3.Connection = Depends(get_db)):
             "id": user_id,
             "username": user.username.lower(),
             "nickname": nickname,
-            "avatar_color": avatar_color
+            "avatar_color": avatar_color,
+            "bio": "Привет, я в Графитоне!"
         }
     }
 
@@ -222,15 +238,36 @@ def login(form_data: OAuth2PasswordRequestForm = Depends(), conn: sqlite3.Connec
             "id": user["id"],
             "username": user["username"],
             "nickname": user["nickname"],
-            "avatar_color": user["avatar_color"]
+            "avatar_color": user["avatar_color"],
+            "bio": user["bio"] if "bio" in user.keys() else ""
         }
     }
 
 @app.get("/api/users", response_model=List[UserResponse])
 def get_all_users(current_user: dict = Depends(get_current_user), conn: sqlite3.Connection = Depends(get_db)):
     cursor = conn.cursor()
-    cursor.execute("SELECT id, username, nickname, avatar_color FROM users ORDER BY nickname ASC")
+    cursor.execute("SELECT id, username, nickname, avatar_color, bio FROM users ORDER BY nickname ASC")
     return [dict(row) for row in cursor.fetchall()]
+
+@app.put("/api/users/profile", response_model=UserResponse)
+def update_profile(profile_data: UserProfileUpdate, current_user: dict = Depends(get_current_user), conn: sqlite3.Connection = Depends(get_db)):
+    cursor = conn.cursor()
+    nickname = profile_data.nickname.strip() if profile_data.nickname else current_user["nickname"]
+    bio = profile_data.bio if profile_data.bio is not None else current_user.get("bio", "")
+    avatar_color = profile_data.avatar_color if profile_data.avatar_color else current_user["avatar_color"]
+
+    cursor.execute("""
+        UPDATE users SET nickname = ?, bio = ?, avatar_color = ? WHERE id = ?
+    """, (nickname, bio, avatar_color, current_user["id"]))
+    conn.commit()
+
+    return {
+        "id": current_user["id"],
+        "username": current_user["username"],
+        "nickname": nickname,
+        "avatar_color": avatar_color,
+        "bio": bio
+    }
 
 @app.get("/api/messages/{chat_id}", response_model=List[MessageResponse])
 def get_chat_messages(chat_id: str, current_user: dict = Depends(get_current_user), conn: sqlite3.Connection = Depends(get_db)):
@@ -284,7 +321,6 @@ async def websocket_endpoint(websocket: WebSocket, token: str):
     try:
         while True:
             data = await websocket.receive_text()
-            # Heartbeat or client ping
             try:
                 msg_json = json.loads(data)
                 if msg_json.get("type") == "ping":
